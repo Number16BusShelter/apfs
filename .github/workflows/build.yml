@@ -27,18 +27,19 @@ jobs:
           echo "$(brew --prefix gettext)/bin" >> "$GITHUB_PATH"
 
       - name: Build ARM64 binaries
+        shell: bash
         working-directory: libfsapfs
         run: |
-          set -euxo pipefail
+          set -euo pipefail
+          test "$(uname -m)" = "arm64"
 
-          uname -m
           ./synclibs.sh
           ./autogen.sh
 
           OPENSSL="$(brew --prefix openssl@3)"
-          export CPPFLAGS="-I$OPENSSL/include"
-          export LDFLAGS="-L$OPENSSL/lib"
-          export PKG_CONFIG_PATH="$OPENSSL/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+          export CPPFLAGS="-I${OPENSSL}/include"
+          export LDFLAGS="-L${OPENSSL}/lib"
+          export PKG_CONFIG_PATH="${OPENSSL}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 
           ./configure \
             --enable-shared=no \
@@ -48,50 +49,89 @@ jobs:
 
           make -j3
 
-          file fsapfstools/.libs/fsapfsinfo
-          fsapfstools/.libs/fsapfsinfo -V
+          echo "Available fsapfsinfo candidates:"
+          find fsapfstools -name fsapfsinfo -exec file {} \;
 
-      - name: Package executable
+      - name: Package macOS ARM64 executable
+        shell: bash
         working-directory: libfsapfs
         run: |
-          set -euxo pipefail
-
+          set -euo pipefail
           DEST="$GITHUB_WORKSPACE/dist"
           mkdir -p "$DEST"
 
-          cp fsapfstools/.libs/fsapfsinfo "$DEST/fsapfsinfo"
-          cp COPYING COPYING.LESSER README "$DEST/"
+          BINARY=""
+          for candidate in \
+            fsapfstools/fsapfsinfo \
+            fsapfstools/.libs/fsapfsinfo; do
+            if [ -f "$candidate" ] && \
+               file "$candidate" | grep -qE 'Mach-O.*arm64'; then
+              BINARY="$candidate"
+              break
+            fi
+          done
 
-          # Bundle non-system libraries used by the executable.
-          otool -L "$DEST/fsapfsinfo"
-
-          while IFS= read -r dep; do
-            case "$dep" in
-              /opt/homebrew/*|/usr/local/Cellar/*|/usr/local/opt/*)
-                name="$(basename "$dep")"
-                cp -L "$dep" "$DEST/$name"
-                install_name_tool -change \
-                  "$dep" "@executable_path/$name" \
-                  "$DEST/fsapfsinfo"
-                codesign --force --sign - "$DEST/$name"
-                ;;
-            esac
-          done < <(otool -L "$DEST/fsapfsinfo" | awk 'NR>1 {print $1}')
-
-          codesign --force --sign - "$DEST/fsapfsinfo"
-
-          # Fail if the executable still needs Homebrew libraries.
-          if otool -L "$DEST/fsapfsinfo" | grep -E '/opt/homebrew/|/usr/local/(Cellar|opt)/'; then
-            echo "Unbundled Homebrew dependency"
+          if [ -z "$BINARY" ]; then
+            echo 'ERROR: ARM64 Mach-O fsapfsinfo not found'
+            find fsapfstools -name '*fsapfsinfo*' -exec file {} \;
             exit 1
           fi
 
-          file "$DEST/fsapfsinfo"
-          otool -L "$DEST/fsapfsinfo"
-          "$DEST/fsapfsinfo" -V
-
+          echo "Using: $BINARY"
+          cp "$BINARY" "$DEST/fsapfsinfo"
+          chmod 755 "$DEST/fsapfsinfo"
+          cp COPYING COPYING.LESSER README "$DEST/"
           git rev-parse HEAD > "$DEST/SOURCE_COMMIT.txt"
-          shasum -a 256 "$DEST/fsapfsinfo" > "$DEST/SHA256SUMS"
+
+          # Collect non-system Homebrew dylibs and fix executable-relative links.
+          # This includes dependencies of bundled libraries, not just the executable.
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import shutil
+          import subprocess
+
+          dest = pathlib.Path(os.environ["GITHUB_WORKSPACE"]) / "dist"
+          executable = dest / "fsapfsinfo"
+          queue = [executable]
+          processed = set()
+
+          def dependencies(path):
+              output = subprocess.check_output(["otool", "-L", str(path)], text=True)
+              return [line.strip().split(" (")[0] for line in output.splitlines()[1:]]
+
+          while queue:
+              current = queue.pop(0)
+              if current in processed:
+                  continue
+              processed.add(current)
+              for dep in dependencies(current):
+                  if dep.startswith(("/usr/lib/", "/System/Library/")):
+                      continue
+                  if dep.startswith(("/opt/homebrew/", "/usr/local/Cellar/", "/usr/local/opt/")):
+                      target = dest / pathlib.Path(dep).name
+                      if not target.exists():
+                          shutil.copy2(os.path.realpath(dep), target)
+                          queue.append(target)
+                      new_name = ("@executable_path/" if current == executable else "@loader_path/") + target.name
+                      subprocess.run(["install_name_tool", "-change", dep, new_name, str(current)], check=True)
+                      continue
+                  if dep.startswith("@loader_path/") or dep.startswith("@executable_path/"):
+                      continue
+                  raise RuntimeError(f"Unresolved runtime dependency in {current}: {dep}")
+
+          for path in dest.iterdir():
+              if path.name == "fsapfsinfo" or path.suffix == ".dylib":
+                  subprocess.run(["codesign", "--force", "--sign", "-", str(path)], check=True)
+          PY
+
+          echo 'Executable architecture:'
+          file "$DEST/fsapfsinfo"
+          echo 'Dependencies:'
+          otool -L "$DEST/fsapfsinfo"
+          echo 'Version test:'
+          "$DEST/fsapfsinfo" -V
+          (cd "$DEST" && shasum -a 256 fsapfsinfo > SHA256SUMS)
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
