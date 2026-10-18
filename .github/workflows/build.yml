@@ -1,0 +1,101 @@
+
+name: Build libfsapfs for Apple Silicon
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout libfsapfs
+        uses: actions/checkout@v4
+        with:
+          repository: libyal/libfsapfs
+          ref: main
+          path: libfsapfs
+          persist-credentials: false
+
+      - name: Install build dependencies
+        run: |
+          brew install autoconf automake libtool gettext pkg-config openssl@3
+          echo "$(brew --prefix gettext)/bin" >> "$GITHUB_PATH"
+
+      - name: Build ARM64 binaries
+        working-directory: libfsapfs
+        run: |
+          set -euxo pipefail
+
+          uname -m
+          ./synclibs.sh
+          ./autogen.sh
+
+          OPENSSL="$(brew --prefix openssl@3)"
+          export CPPFLAGS="-I$OPENSSL/include"
+          export LDFLAGS="-L$OPENSSL/lib"
+          export PKG_CONFIG_PATH="$OPENSSL/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+
+          ./configure \
+            --enable-shared=no \
+            --with-libfuse=no \
+            --enable-verbose-output \
+            --enable-debug-output
+
+          make -j3
+
+          file fsapfstools/.libs/fsapfsinfo
+          fsapfstools/.libs/fsapfsinfo -V
+
+      - name: Package executable
+        working-directory: libfsapfs
+        run: |
+          set -euxo pipefail
+
+          DEST="$GITHUB_WORKSPACE/dist"
+          mkdir -p "$DEST"
+
+          cp fsapfstools/.libs/fsapfsinfo "$DEST/fsapfsinfo"
+          cp COPYING COPYING.LESSER README "$DEST/"
+
+          # Bundle non-system libraries used by the executable.
+          otool -L "$DEST/fsapfsinfo"
+
+          while IFS= read -r dep; do
+            case "$dep" in
+              /opt/homebrew/*|/usr/local/Cellar/*|/usr/local/opt/*)
+                name="$(basename "$dep")"
+                cp -L "$dep" "$DEST/$name"
+                install_name_tool -change \
+                  "$dep" "@executable_path/$name" \
+                  "$DEST/fsapfsinfo"
+                codesign --force --sign - "$DEST/$name"
+                ;;
+            esac
+          done < <(otool -L "$DEST/fsapfsinfo" | awk 'NR>1 {print $1}')
+
+          codesign --force --sign - "$DEST/fsapfsinfo"
+
+          # Fail if the executable still needs Homebrew libraries.
+          if otool -L "$DEST/fsapfsinfo" | grep -E '/opt/homebrew/|/usr/local/(Cellar|opt)/'; then
+            echo "Unbundled Homebrew dependency"
+            exit 1
+          fi
+
+          file "$DEST/fsapfsinfo"
+          otool -L "$DEST/fsapfsinfo"
+          "$DEST/fsapfsinfo" -V
+
+          git rev-parse HEAD > "$DEST/SOURCE_COMMIT.txt"
+          shasum -a 256 "$DEST/fsapfsinfo" > "$DEST/SHA256SUMS"
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: fsapfsinfo-macos-arm64
+          path: dist/
+          retention-days: 30
