@@ -1,5 +1,4 @@
-
-name: Build libfsapfs for Apple Silicon
+name: Build complete libfsapfs ARM64 toolkit
 
 on:
   workflow_dispatch:
@@ -10,132 +9,247 @@ permissions:
 jobs:
   build:
     runs-on: macos-15
-    timeout-minutes: 90
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
 
     steps:
-      - name: Checkout libfsapfs
+      - name: Checkout upstream source
         uses: actions/checkout@v4
         with:
           repository: libyal/libfsapfs
           ref: main
-          path: libfsapfs
+          path: source
           persist-credentials: false
 
-      - name: Install build dependencies
+      - name: Install build tools
         run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
           brew install autoconf automake libtool gettext pkg-config openssl@3
           echo "$(brew --prefix gettext)/bin" >> "$GITHUB_PATH"
 
-      - name: Build ARM64 binaries
-        shell: bash
-        working-directory: libfsapfs
+      - name: Try installing macFUSE development support
         run: |
           set -euo pipefail
-          test "$(uname -m)" = "arm64"
+          # Only on GitHub's disposable runner, not the recovery Mac.
+          # The kernel extension cannot be approved/loaded in hosted CI.
+          if brew install --cask macfuse; then
+            echo 'macFUSE installation completed'
+          else
+            echo 'macFUSE unavailable; mounting may be disabled'
+          fi
+          ls -la /usr/local/include/fuse /usr/local/include/osxfuse /usr/local/lib/pkgconfig 2>/dev/null || true
+          pkg-config --modversion fuse 2>/dev/null || true
 
-          ./synclibs.sh
-          ./autogen.sh
+      - name: Prepare identical build trees
+        run: |
+          set -euo pipefail
+          cp -R source normal-src
+          cp -R source debug-src
+          mkdir -p dist/normal/{bin,lib,include} dist/debug/{bin,lib,include}
+          git -C source rev-parse HEAD > dist/SOURCE_COMMIT.txt
+          cp source/COPYING source/COPYING.LESSER source/README dist/
 
+      - name: Build normal and debug tools and libraries
+        run: |
+          set -euo pipefail
           OPENSSL="$(brew --prefix openssl@3)"
           export CPPFLAGS="-I${OPENSSL}/include"
           export LDFLAGS="-L${OPENSSL}/lib"
-          export PKG_CONFIG_PATH="${OPENSSL}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+          export PKG_CONFIG_PATH="${OPENSSL}/lib/pkgconfig:/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 
-          ./configure \
-            --enable-shared=no \
-            --with-libfuse=no \
-            --enable-verbose-output \
-            --enable-debug-output
+          FUSE_FLAG='--with-libfuse=no'
+          if pkg-config --exists fuse || \
+             [ -f /usr/local/include/osxfuse/fuse/fuse.h ] || \
+             [ -f /usr/local/include/fuse/fuse.h ]; then
+            FUSE_FLAG='--with-libfuse=yes'
+          fi
+          echo "FUSE configuration requested: $FUSE_FLAG" | tee dist/FUSE_STATUS.txt
 
-          make -j3
+          for variant in normal debug; do
+            (
+              cd "${variant}-src"
+              ./synclibs.sh
+              ./autogen.sh
 
-          echo "Available fsapfsinfo candidates:"
-          find fsapfstools -name fsapfsinfo -exec file {} \;
+              if [ "$variant" = normal ]; then
+                DEBUG_FLAG='--disable-debug-output'
+              else
+                DEBUG_FLAG='--enable-debug-output'
+              fi
 
-      - name: Package macOS ARM64 executable
-        shell: bash
-        working-directory: libfsapfs
-        run: |
-          set -euo pipefail
-          DEST="$GITHUB_WORKSPACE/dist"
-          mkdir -p "$DEST"
+              ./configure \
+                --enable-shared=yes \
+                --enable-static=yes \
+                --enable-verbose-output \
+                "$DEBUG_FLAG" \
+                "$FUSE_FLAG" | tee "../dist/${variant}/configure.log"
 
-          BINARY=""
-          for candidate in \
-            fsapfstools/fsapfsinfo \
-            fsapfstools/.libs/fsapfsinfo; do
-            if [ -f "$candidate" ] && \
-               file "$candidate" | grep -qE 'Mach-O.*arm64'; then
-              BINARY="$candidate"
-              break
-            fi
+              make -j3
+
+              OUT="../dist/${variant}"
+
+              for tool in fsapfsinfo fsapfsmount; do
+                FOUND=''
+                for candidate in \
+                  "fsapfstools/.libs/${tool}" \
+                  "fsapfstools/${tool}"; do
+
+                  if [ -f "$candidate" ] && \
+                     file "$candidate" | grep -Eq 'Mach-O.*arm64'; then
+                    FOUND="$candidate"
+                    break
+                  fi
+                done
+
+                if [ -z "$FOUND" ]; then
+                  echo "Missing ARM64 executable: ${tool} (${variant})" >&2
+                  find fsapfstools -name "*${tool}*" -exec file {} \;
+                  exit 1
+                fi
+
+                cp "$FOUND" "${OUT}/bin/${tool}"
+                chmod +x "${OUT}/bin/${tool}"
+              done
+
+              LIB_A="$(find libfsapfs/.libs -maxdepth 1 \
+                -type f -name 'libfsapfs.a' -print -quit)"
+              test -n "$LIB_A"
+              cp "$LIB_A" "${OUT}/lib/libfsapfs.a"
+
+              LIB_DYLIB="$(find libfsapfs/.libs -maxdepth 1 \
+                -type f -name 'libfsapfs*.dylib' -print -quit)"
+
+              if [ -z "$LIB_DYLIB" ]; then
+                echo "Missing shared libfsapfs dylib (${variant})" >&2
+                exit 1
+              fi
+
+              cp "$LIB_DYLIB" "${OUT}/lib/$(basename "$LIB_DYLIB")"
+              cp -R include/. "${OUT}/include/"
+
+              file "${OUT}/bin/fsapfsinfo" \
+                   "${OUT}/bin/fsapfsmount" \
+                   "${OUT}/lib/$(basename "$LIB_DYLIB")"
+            )
           done
 
-          if [ -z "$BINARY" ]; then
-            echo 'ERROR: ARM64 Mach-O fsapfsinfo not found'
-            find fsapfstools -name '*fsapfsinfo*' -exec file {} \;
-            exit 1
-          fi
-
-          echo "Using: $BINARY"
-          cp "$BINARY" "$DEST/fsapfsinfo"
-          chmod 755 "$DEST/fsapfsinfo"
-          cp COPYING COPYING.LESSER README "$DEST/"
-          git rev-parse HEAD > "$DEST/SOURCE_COMMIT.txt"
-
-          # Collect non-system Homebrew dylibs and fix executable-relative links.
-          # This includes dependencies of bundled libraries, not just the executable.
+      - name: Bundle dynamic dependencies and verify both variants
+        run: |
+          set -euo pipefail
           python3 - <<'PY'
+          from pathlib import Path
           import os
-          import pathlib
           import shutil
           import subprocess
 
-          dest = pathlib.Path(os.environ["GITHUB_WORKSPACE"]) / "dist"
-          executable = dest / "fsapfsinfo"
-          queue = [executable]
-          processed = set()
+          def invoke(*args):
+              subprocess.run(args, check=True)
 
-          def dependencies(path):
-              output = subprocess.check_output(["otool", "-L", str(path)], text=True)
-              return [line.strip().split(" (")[0] for line in output.splitlines()[1:]]
+          def deps(path):
+              out = subprocess.check_output(
+                  ['otool', '-L', str(path)], text=True
+              )
+              return [
+                  line.strip().split(' (', 1)[0]
+                  for line in out.splitlines()[1:]
+              ]
 
-          while queue:
-              current = queue.pop(0)
-              if current in processed:
-                  continue
-              processed.add(current)
-              for dep in dependencies(current):
-                  if dep.startswith(("/usr/lib/", "/System/Library/")):
+          for variant in ('normal', 'debug'):
+              root = Path('dist') / variant
+              bin_dir = root / 'bin'
+              lib_dir = root / 'lib'
+
+              queue = [
+                  bin_dir / 'fsapfsinfo',
+                  bin_dir / 'fsapfsmount'
+              ]
+              queue += list(lib_dir.glob('*.dylib'))
+              visited = set()
+
+              while queue:
+                  item = queue.pop(0)
+                  if item in visited:
                       continue
-                  if dep.startswith(("/opt/homebrew/", "/usr/local/Cellar/", "/usr/local/opt/")):
-                      target = dest / pathlib.Path(dep).name
-                      if not target.exists():
-                          shutil.copy2(os.path.realpath(dep), target)
+                  visited.add(item)
+
+                  for dep in deps(item):
+                      if dep.startswith((
+                          '/usr/lib/',
+                          '/System/Library/'
+                      )):
+                          continue
+
+                      if dep.startswith((
+                          '@executable_path/',
+                          '@loader_path/'
+                      )):
+                          continue
+
+                      if dep.startswith('@rpath/'):
+                          target = lib_dir / Path(dep).name
+                          if not target.exists():
+                              raise RuntimeError(
+                                  f'Unbundled rpath dependency: {dep} in {item}'
+                              )
+                      elif dep.startswith('/'):
+                          target = lib_dir / Path(dep).name
+                          if not target.exists():
+                              if not os.path.isfile(dep):
+                                  raise RuntimeError(
+                                      f'Missing library: {dep} in {item}'
+                                  )
+                              shutil.copy2(os.path.realpath(dep), target)
                           queue.append(target)
-                      new_name = ("@executable_path/" if current == executable else "@loader_path/") + target.name
-                      subprocess.run(["install_name_tool", "-change", dep, new_name, str(current)], check=True)
-                      continue
-                  if dep.startswith("@loader_path/") or dep.startswith("@executable_path/"):
-                      continue
-                  raise RuntimeError(f"Unresolved runtime dependency in {current}: {dep}")
+                      else:
+                          raise RuntimeError(
+                              f'Unknown dependency: {dep} in {item}'
+                          )
 
-          for path in dest.iterdir():
-              if path.name == "fsapfsinfo" or path.suffix == ".dylib":
-                  subprocess.run(["codesign", "--force", "--sign", "-", str(path)], check=True)
+                      prefix = (
+                          '@executable_path/../lib/'
+                          if item.parent == bin_dir
+                          else '@loader_path/'
+                      )
+                      invoke(
+                          'install_name_tool', '-change',
+                          dep, prefix + target.name, str(item)
+                      )
+
+              for dylib in lib_dir.glob('*.dylib'):
+                  invoke(
+                      'install_name_tool',
+                      '-id',
+                      '@rpath/' + dylib.name,
+                      str(dylib)
+                  )
+
+              for item in visited:
+                  invoke('codesign', '--force', '--sign', '-', str(item))
+
+              for tool in ('fsapfsinfo', 'fsapfsmount'):
+                  p = bin_dir / tool
+                  invoke('file', str(p))
+                  invoke('otool', '-L', str(p))
+                  invoke(str(p.resolve()), '-V')
+                  invoke(str(p.resolve()), '-h')
           PY
 
-          echo 'Executable architecture:'
-          file "$DEST/fsapfsinfo"
-          echo 'Dependencies:'
-          otool -L "$DEST/fsapfsinfo"
-          echo 'Version test:'
-          "$DEST/fsapfsinfo" -V
-          (cd "$DEST" && shasum -a 256 fsapfsinfo > SHA256SUMS)
+          (
+            cd dist
+            find normal debug -type f \
+              \( -name 'fsapfsinfo' \
+              -o -name 'fsapfsmount' \
+              -o -name 'libfsapfs.a' \
+              -o -name '*.dylib' \) \
+              -print0 | xargs -0 shasum -a 256 > SHA256SUMS
+          )
 
-      - name: Upload binary
+      - name: Upload complete toolkit
         uses: actions/upload-artifact@v4
         with:
-          name: fsapfsinfo-macos-arm64
+          name: libfsapfs-complete-macos-arm64
           path: dist/
           retention-days: 30
