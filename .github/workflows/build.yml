@@ -33,8 +33,7 @@ jobs:
       - name: Try installing macFUSE development support
         run: |
           set -euo pipefail
-          # Only on GitHub's disposable runner, not the recovery Mac.
-          # The kernel extension cannot be approved/loaded in hosted CI.
+          # Only on the disposable GitHub runner, not the recovery Mac.
           if brew install --cask macfuse; then
             echo 'macFUSE installation completed'
           else
@@ -90,160 +89,222 @@ jobs:
               make -j3
 
               OUT="../dist/${variant}"
-
               for tool in fsapfsinfo fsapfsmount; do
                 FOUND=''
                 for candidate in \
                   "fsapfstools/.libs/${tool}" \
                   "fsapfstools/${tool}"; do
-
                   if [ -f "$candidate" ] && \
                      file "$candidate" | grep -Eq 'Mach-O.*arm64'; then
                     FOUND="$candidate"
                     break
                   fi
                 done
-
                 if [ -z "$FOUND" ]; then
                   echo "Missing ARM64 executable: ${tool} (${variant})" >&2
                   find fsapfstools -name "*${tool}*" -exec file {} \;
                   exit 1
                 fi
-
                 cp "$FOUND" "${OUT}/bin/${tool}"
                 chmod +x "${OUT}/bin/${tool}"
               done
 
-              LIB_A="$(find libfsapfs/.libs -maxdepth 1 \
-                -type f -name 'libfsapfs.a' -print -quit)"
+              LIB_A="$(find libfsapfs/.libs -maxdepth 1 -type f -name 'libfsapfs.a' -print -quit)"
               test -n "$LIB_A"
               cp "$LIB_A" "${OUT}/lib/libfsapfs.a"
 
-              LIB_DYLIB="$(find libfsapfs/.libs -maxdepth 1 \
-                -type f -name 'libfsapfs*.dylib' -print -quit)"
-
-              if [ -z "$LIB_DYLIB" ]; then
+              DYLIB_COUNT=0
+              for library in libfsapfs/.libs/libfsapfs*.dylib; do
+                [ -e "$library" ] || continue
+                cp -L "$library" "${OUT}/lib/$(basename "$library")"
+                DYLIB_COUNT=$((DYLIB_COUNT + 1))
+              done
+              if [ "$DYLIB_COUNT" -eq 0 ]; then
                 echo "Missing shared libfsapfs dylib (${variant})" >&2
                 exit 1
               fi
 
-              cp "$LIB_DYLIB" "${OUT}/lib/$(basename "$LIB_DYLIB")"
               cp -R include/. "${OUT}/include/"
-
               file "${OUT}/bin/fsapfsinfo" \
                    "${OUT}/bin/fsapfsmount" \
-                   "${OUT}/lib/$(basename "$LIB_DYLIB")"
+                   "${OUT}"/lib/*.dylib
             )
           done
 
       - name: Bundle dynamic dependencies and verify both variants
         run: |
           set -euo pipefail
-          python3 - <<'PY'
+          python3 - <<'PYBUNDLE'
           from pathlib import Path
           import os
           import shutil
           import subprocess
 
-          def invoke(*args):
+          def cmd(*args):
               subprocess.run(args, check=True)
 
-          def deps(path):
-              out = subprocess.check_output(
-                  ['otool', '-L', str(path)], text=True
-              )
+          def output(*args):
+              return subprocess.check_output(args, text=True)
+
+          def dependencies(path):
+              # A dylib's own install name appears in otool -L.
+              # It is not an external dependency.
+              lines = output('otool', '-L', str(path)).splitlines()[1:]
               return [
                   line.strip().split(' (', 1)[0]
-                  for line in out.splitlines()[1:]
+                  for line in lines if line.strip()
               ]
+
+          def own_install_name(path):
+              if path.suffix != '.dylib':
+                  return None
+              lines = output('otool', '-D', str(path)).splitlines()
+              return lines[1].strip() if len(lines) > 1 else None
+
+          def resolve_source(dep, current, bin_dir, lib_dir):
+              name = Path(dep).name
+              candidates = [lib_dir / name]
+
+              if dep.startswith('@loader_path/'):
+                  candidates.insert(
+                      0, current.parent / dep[len('@loader_path/'):]
+                  )
+              elif dep.startswith('@executable_path/'):
+                  candidates.insert(
+                      0, bin_dir / dep[len('@executable_path/'):]
+                  )
+              elif dep.startswith('/') or not dep.startswith('@'):
+                  candidates.insert(0, Path(dep))
+
+              candidates.extend([
+                  Path('/opt/homebrew/lib') / name,
+                  Path('/opt/homebrew/opt/openssl@3/lib') / name,
+                  Path('/usr/local/lib') / name,
+              ])
+
+              for candidate in candidates:
+                  if candidate.is_file():
+                      return candidate
+
+              raise RuntimeError(
+                  f'Unable to locate dependency {dep} required by {current}'
+              )
 
           for variant in ('normal', 'debug'):
               root = Path('dist') / variant
-              bin_dir = root / 'bin'
-              lib_dir = root / 'lib'
+              bin_dir, lib_dir = root / 'bin', root / 'lib'
 
-              queue = [
+              executable_paths = [
                   bin_dir / 'fsapfsinfo',
                   bin_dir / 'fsapfsmount'
               ]
-              queue += list(lib_dir.glob('*.dylib'))
+
+              queue = executable_paths + sorted(lib_dir.glob('*.dylib'))
               visited = set()
 
               while queue:
-                  item = queue.pop(0)
-                  if item in visited:
+                  current = queue.pop(0)
+                  if current in visited:
                       continue
-                  visited.add(item)
 
-                  for dep in deps(item):
-                      if dep.startswith((
-                          '/usr/lib/',
-                          '/System/Library/'
-                      )):
+                  visited.add(current)
+                  own_id = own_install_name(current)
+
+                  for dep in dependencies(current):
+                      if dep == own_id:
+                          # Ignore the dylib's own install-name entry.
                           continue
 
-                      if dep.startswith((
-                          '@executable_path/',
-                          '@loader_path/'
-                      )):
+                      if dep.startswith(('/usr/lib/', '/System/Library/')):
                           continue
 
-                      if dep.startswith('@rpath/'):
-                          target = lib_dir / Path(dep).name
-                          if not target.exists():
-                              raise RuntimeError(
-                                  f'Unbundled rpath dependency: {dep} in {item}'
-                              )
-                      elif dep.startswith('/'):
-                          target = lib_dir / Path(dep).name
-                          if not target.exists():
-                              if not os.path.isfile(dep):
-                                  raise RuntimeError(
-                                      f'Missing library: {dep} in {item}'
-                                  )
-                              shutil.copy2(os.path.realpath(dep), target)
-                          queue.append(target)
-                      else:
-                          raise RuntimeError(
-                              f'Unknown dependency: {dep} in {item}'
+                      name = Path(dep).name
+                      target = lib_dir / name
+
+                      source = resolve_source(
+                          dep, current, bin_dir, lib_dir
+                      )
+
+                      if not target.is_file():
+                          shutil.copy2(os.path.realpath(source), target)
+
+                      queue.append(target)
+
+                      replacement = (
+                          '@executable_path/../lib/'
+                          if current in executable_paths
+                          else '@loader_path/'
+                      ) + name
+
+                      if dep != replacement:
+                          cmd(
+                              'install_name_tool',
+                              '-change',
+                              dep,
+                              replacement,
+                              str(current)
                           )
 
-                      prefix = (
-                          '@executable_path/../lib/'
-                          if item.parent == bin_dir
-                          else '@loader_path/'
-                      )
-                      invoke(
-                          'install_name_tool', '-change',
-                          dep, prefix + target.name, str(item)
+                  if current.suffix == '.dylib':
+                      cmd(
+                          'install_name_tool',
+                          '-id',
+                          '@rpath/' + current.name,
+                          str(current)
                       )
 
-              for dylib in lib_dir.glob('*.dylib'):
-                  invoke(
-                      'install_name_tool',
-                      '-id',
-                      '@rpath/' + dylib.name,
-                      str(dylib)
+              # Sign only after finishing all install-name changes.
+              for library in sorted(visited):
+                  if library not in executable_paths:
+                      cmd(
+                          'codesign', '--force', '--sign', '-',
+                          str(library)
+                      )
+
+              for executable in executable_paths:
+                  cmd(
+                      'codesign', '--force', '--sign', '-',
+                      str(executable)
                   )
+                  cmd('file', str(executable))
+                  cmd('otool', '-L', str(executable))
+                  cmd(str(executable.resolve()), '-V')
+                  cmd(str(executable.resolve()), '-h')
 
+              # Validate that no external non-system dependencies remain.
               for item in visited:
-                  invoke('codesign', '--force', '--sign', '-', str(item))
+                  own_id = own_install_name(item)
 
-              for tool in ('fsapfsinfo', 'fsapfsmount'):
-                  p = bin_dir / tool
-                  invoke('file', str(p))
-                  invoke('otool', '-L', str(p))
-                  invoke(str(p.resolve()), '-V')
-                  invoke(str(p.resolve()), '-h')
-          PY
+                  for dep in dependencies(item):
+                      if dep == own_id or dep.startswith(
+                          ('/usr/lib/', '/System/Library/')
+                      ):
+                          continue
+
+                      if not dep.startswith((
+                          '@executable_path/../lib/',
+                          '@loader_path/'
+                      )):
+                          raise RuntimeError(
+                              f'Unportable dependency {dep} in {item}'
+                          )
+
+                      if not (lib_dir / Path(dep).name).is_file():
+                          raise RuntimeError(
+                              f'Missing packaged library {dep} for {item}'
+                          )
+
+              print(
+                  f'{variant}: dependencies bundled, '
+                  'both executables verified'
+              )
+          PYBUNDLE
 
           (
             cd dist
             find normal debug -type f \
-              \( -name 'fsapfsinfo' \
-              -o -name 'fsapfsmount' \
-              -o -name 'libfsapfs.a' \
-              -o -name '*.dylib' \) \
+              \( -name 'fsapfsinfo' -o -name 'fsapfsmount' \
+                 -o -name 'libfsapfs.a' -o -name '*.dylib' \) \
               -print0 | xargs -0 shasum -a 256 > SHA256SUMS
           )
 
